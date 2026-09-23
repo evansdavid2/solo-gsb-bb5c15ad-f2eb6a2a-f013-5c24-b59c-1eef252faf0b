@@ -221,6 +221,9 @@ class SampleBalance(BaseModel):
     adjustments: float = Field(
         default=0.0, description="盘点调整流水合计(实盘-系统,可正可负)"
     )
+    consumed: float = Field(
+        default=0.0, description="核销领用出账合计(对预留单的分次领用量,非谱系出账)"
+    )
     available: float
 
 
@@ -261,8 +264,16 @@ class ReservationItemOut(BaseModel):
     amount: float
     unit: str
     remaining: float = Field(description="样品当前余量(冗余余量)")
-    reserved: float = Field(description="该样品未释放预留的锁定总量(含本单)")
-    available: float = Field(description="可用量 = 当前余量 - 未释放预留")
+    reserved: float = Field(
+        description="该样品未释放预留的当前锁定总量(只计各预留明细的未核销部分,含本单)"
+    )
+    available: float = Field(description="可用量 = 当前余量 - 未核销锁定量")
+    consumed: float = Field(
+        default=0.0, description="本预留单对该样品已分次核销领用的合计"
+    )
+    remaining_locked: float = Field(
+        default=0.0, description="本预留明细当前仍锁定的未核销量 = amount - consumed"
+    )
 
 
 class ReservationResult(BaseModel):
@@ -301,6 +312,69 @@ class SampleAvailability(BaseModel):
 
 class AvailabilityResponse(BaseModel):
     samples: list[SampleAvailability]
+
+
+# ---------------------------------------------------------------- 核销领用
+
+class ConsumptionItemIn(BaseModel):
+    """核销领用明细:从指定预留单中领用该样品 amount(单位沿用预留明细)。"""
+
+    sample_id: str = Field(min_length=1)
+    amount: Amount
+
+
+class ConsumptionRequest(BaseModel):
+    """对现有预留单做一次分次核销领用。
+
+    - 核销号 consumption_no 为幂等键:同号同内容返回首次结果,同号不同内容 409
+    - 预留单必须未释放;逐项校验领用量不超过该预留明细的未核销量与样品余量
+    - 任一项失败整单不变;成功后扣减样品余量、递增版本并写不可变核销明细
+    """
+
+    consumption_no: str = Field(min_length=1, description="核销号(幂等键),全局唯一")
+    reservation_no: str = Field(min_length=1, description="被核销的预留号")
+    items: list[ConsumptionItemIn] = Field(min_length=1)
+    operator: Optional[str] = Field(default=None, description="领用人/核销操作者(审计展示)")
+    note: Optional[str] = Field(default=None, description="备注,仅用于审计展示")
+
+    @model_validator(mode="after")
+    def _check_items(self) -> "ConsumptionRequest":
+        ids = [i.sample_id for i in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("items 中存在重复 sample_id")
+        return self
+
+
+class ConsumptionItemOut(BaseModel):
+    sample_id: str
+    amount: float = Field(description="本次核销领用量")
+    unit: str
+    locked_amount: float = Field(description="该预留明细的原始锁定量")
+    consumed_before: float = Field(description="本次之前该预留明细的累计已核销量")
+    consumed_total: float = Field(description="本次之后该预留明细的累计已核销量")
+    remaining_locked: float = Field(
+        description="核销后该预留明细仍锁定的未核销量 = locked_amount - consumed_total"
+    )
+    remaining: float = Field(description="核销后的样品当前余量")
+    reserved: float = Field(description="核销后该样品未释放预留的未核销锁定总量")
+    available: float = Field(description="核销后的可用量 = 当前余量 - 未核销锁定量")
+    from_version: int
+    to_version: int
+
+
+class ConsumptionResult(BaseModel):
+    consumption_no: str
+    reservation_no: str
+    status: Literal["active", "released"] = Field(
+        description="被核销预留单在核销时的状态(只允许 active)"
+    )
+    items: list[ConsumptionItemOut] = Field(description="逐项核销领用明细")
+    operator: Optional[str] = None
+    note: Optional[str] = None
+    replayed: bool = Field(
+        default=False, description="True 表示命中核销号幂等,返回首次结果"
+    )
+    created_at: Optional[str] = None
 
 
 # ---------------------------------------------------------------- 盘点

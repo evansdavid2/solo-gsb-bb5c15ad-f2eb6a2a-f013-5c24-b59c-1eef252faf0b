@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, Query
 from fastapi.responses import JSONResponse
 
 from . import schemas as s
+from . import consumptions as con
 from . import reservations as rsv
 from . import service
 from . import stocktakes as st
@@ -41,8 +42,12 @@ app = FastAPI(
         "  单事务按可用量(余量-未释放预留)逐项校验,任一不足整体回滚,\n"
         "  成功后写不可变销毁审计记录与出库流水并递增样品版本\n"
         "- 预留模块:一个预留号为多个样品分别锁定数量,\n"
-        "  单事务校验各样品可用量(余量-未释放预留),全部足够才创建,\n"
+        "  单事务校验各样品可用量(余量-未释放预留的未核销部分),全部足够才创建,\n"
         "  支持按预留号幂等重放与整单释放\n"
+        "- 核销领用:对现有预留单分次领用,提交核销号/预留号/逐项领用量,\n"
+        "  单事务校验预留未释放、逐项未核销量与样品余量,任一失败整单不变,\n"
+        "  成功后扣减余量、递增版本并写不可变核销明细,按核销号幂等重放;\n"
+        "  核销后只将未核销部分计入锁定量,释放预留仅解除剩余锁定\n"
         "- 盘点模块:按样品编号集合建批保存余量/版本快照,\n"
         "  提交实盘时乐观锁校验余量未被改变并计算差异,\n"
         "  确认时单事务二次校验版本、写盘点调整流水并更新余量\n"
@@ -52,7 +57,7 @@ app = FastAPI(
         "  全部通过后统一更新位置并记录交接人、时间与变更前后位置,\n"
         "  支持按样品查询交接历史,按交接单号幂等重放"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -106,6 +111,22 @@ async def transfer_error_handler(
         status_code=409,
         content={
             "error": "conflict",
+            "conflicts": [c.model_dump() for c in exc.conflicts],
+        },
+    )
+
+
+@app.exception_handler(con.ConsumptionError)
+async def consumption_error_handler(
+    _request, exc: con.ConsumptionError
+) -> JSONResponse:
+    code = exc.conflicts[0].code if exc.conflicts else "consumption_error"
+    not_found = {"reservation_not_found", "consumption_not_found"}
+    status_code = 404 if code in not_found else 409
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": code if status_code == 404 else "conflict",
             "conflicts": [c.model_dump() for c in exc.conflicts],
         },
     )
@@ -428,7 +449,7 @@ def release_reservation(
     "/api/v1/reservations",
     response_model=s.AvailabilityResponse,
     tags=["预留"],
-    summary="样品可用量查询:当前余量、已预留量与可用量(可用量 = 余量 - 未释放预留)",
+    summary="样品可用量查询:当前余量、已预留量与可用量(可用量 = 余量 - 未释放预留的未核销部分)",
 )
 def query_availability(
     sample_id: Optional[list[str]] = Query(
@@ -437,6 +458,35 @@ def query_availability(
     conn: sqlite3.Connection = Depends(get_conn),
 ) -> s.AvailabilityResponse:
     return rsv.get_availability(conn, sample_id)
+
+
+# ---------------------------------------------------------------- 核销领用
+
+@app.post(
+    "/api/v1/consumptions",
+    response_model=s.ConsumptionResult,
+    tags=["核销领用"],
+    summary="对现有预留单分次核销领用:单事务校验预留未释放、逐项未核销量与样品余量,"
+            "任一失败整单不变;成功扣减余量、递增版本并写不可变核销明细",
+)
+def create_consumption(
+    body: s.ConsumptionRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.ConsumptionResult:
+    return con.create_consumption(conn, body)
+
+
+@app.get(
+    "/api/v1/consumptions/{consumption_no}",
+    response_model=s.ConsumptionResult,
+    tags=["核销领用"],
+    summary="按核销号查询首次核销领用结果(幂等回放内容)",
+)
+def get_consumption(
+    consumption_no: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.ConsumptionResult:
+    return con.get_consumption(conn, consumption_no)
 
 
 # ---------------------------------------------------------------- 盘点

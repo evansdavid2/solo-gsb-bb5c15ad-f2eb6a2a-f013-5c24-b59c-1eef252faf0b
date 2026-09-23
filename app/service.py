@@ -374,13 +374,20 @@ def _shortest_path(
 def _reserved_map(
     conn: sqlite3.Connection, sample_ids: list[str]
 ) -> dict[str, float]:
-    """各样品未释放预留的锁定总量(与预留模块同口径)。"""
+    """各样品未释放预留的**未核销**锁定总量(与预留模块同口径)。
+
+    核销领用后只把预留明细的未核销部分继续计入锁定量。
+    """
     out: dict[str, float] = {sid: 0.0 for sid in sample_ids}
     if not sample_ids:
         return out
     qmarks = ",".join("?" * len(sample_ids))
     rows = conn.execute(
-        f"""SELECT ri.sample_id AS sample_id, SUM(ri.amount) AS reserved
+        f"""SELECT ri.sample_id AS sample_id,
+                   SUM(ri.amount - COALESCE(
+                       (SELECT SUM(ci.amount) FROM consumption_items ci
+                         WHERE ci.reservation_no = ri.reservation_no
+                           AND ci.sample_id = ri.sample_id), 0)) AS reserved
               FROM reservation_items ri
               JOIN reservations r ON r.reservation_no = ri.reservation_no
              WHERE r.status = 'active'
@@ -826,14 +833,18 @@ def trace_sample(
 
 # ---------------------------------------------------------------- 余量校验
 
-def _ledger_remaining(conn: sqlite3.Connection, sample_id: str) -> tuple[float, float, float]:
+def _ledger_remaining(
+    conn: sqlite3.Connection, sample_id: str
+) -> tuple[float, float, float, float, float]:
     """账本重算余量。
 
     - 非根样品:Σin − Σout(全部来自谱系转移)
     - 根样品(取样):initial_amount 即外部来源,取样的那条 in 流水与它同源,
       重算时排除,避免双算;之后仍可能被其他样品并入(Σin)。
-    - 销毁(dispose_id 非空的 out 流水,无谱系边)与盘点调整
-      (stocktake_adjustments.delta,可正可负)作为非谱系流水一并计入。
+    - 销毁(dispose_id 非空的 out 流水,无谱系边)作为非谱系出账计入 Σout;
+      盘点调整(stocktake_adjustments.delta,可正可负)作为非谱系调整计入;
+      核销领用(consumption_items.amount,对预留单的分次领用)作为非谱系出账
+      单独扣减,不写谱系边。
     """
     smp = conn.execute(
         "SELECT initial_amount, is_root FROM samples WHERE sample_id = ?",
@@ -854,10 +865,19 @@ def _ledger_remaining(conn: sqlite3.Connection, sample_id: str) -> tuple[float, 
         " WHERE sample_id = ?",
         (sample_id,),
     ).fetchone()
+    cons = conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) AS c FROM consumption_items"
+        " WHERE sample_id = ?",
+        (sample_id,),
+    ).fetchone()
     source = smp["initial_amount"] if is_root else 0.0
     tin, tout = _r(row["tin"]), _r(row["tout"])
     adjustments = _r(adj["d"])
-    return tin, tout, _r(source + tin - tout + adjustments)
+    consumed = _r(cons["c"])
+    return (
+        tin, tout, adjustments, consumed,
+        _r(source + tin - tout + adjustments - consumed),
+    )
 
 
 def get_balance(
@@ -869,7 +889,7 @@ def get_balance(
             _conflict("sample_not_found", f"样品 {sample_id} 不存在",
                       sample_id=sample_id)
         ])
-    tin, tout, ledger_rem = _ledger_remaining(conn, sample_id)
+    tin, tout, adjustments, consumed, ledger_rem = _ledger_remaining(conn, sample_id)
     stored = _r(smp["remaining"])
     adj_row = conn.execute(
         "SELECT COALESCE(SUM(delta), 0) AS d FROM stocktake_adjustments"
@@ -885,6 +905,7 @@ def get_balance(
         total_in=tin,
         total_out=tout,
         adjustments=_r(adj_row["d"]),
+        consumed=consumed,
         available=stored,
     )
 

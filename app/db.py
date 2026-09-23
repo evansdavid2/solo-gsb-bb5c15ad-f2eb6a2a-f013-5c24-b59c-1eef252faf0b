@@ -112,6 +112,68 @@ CREATE TABLE IF NOT EXISTS reservation_events (
 
 CREATE INDEX IF NOT EXISTS idx_revents_reservation ON reservation_events(reservation_no);
 
+-- 核销领用单:一个核销号(consumption_no,幂等键)对一张未释放预留单做一次分次领用;
+-- 头表不可变(触发器禁止 UPDATE/DELETE),result_snapshot 保存首次提交的原始结果
+CREATE TABLE IF NOT EXISTS consumptions (
+    consumption_no  TEXT PRIMARY KEY,
+    reservation_no  TEXT NOT NULL,
+    payload         TEXT NOT NULL,
+    result_snapshot TEXT NOT NULL,
+    operator        TEXT,
+    note            TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY (reservation_no) REFERENCES reservations(reservation_no)
+);
+
+-- 核销明细:逐项记录从预留单中实际领用的样品量,随核销单在同一事务写入;
+-- 触发器禁止 UPDATE/DELETE(不可变审计)。核销成功即扣减 samples.remaining 并 +1 版本;
+-- 核销量计入余量账本重算(非谱系出账),并把该预留明细的剩余锁定量冲减为「未核销部分」
+CREATE TABLE IF NOT EXISTS consumption_items (
+    item_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    consumption_no  TEXT NOT NULL,
+    reservation_no  TEXT NOT NULL,
+    sample_id       TEXT NOT NULL,
+    amount          REAL NOT NULL CHECK (amount > 0),
+    unit            TEXT NOT NULL,
+    seq_index       INTEGER NOT NULL,
+    from_version    INTEGER NOT NULL,
+    to_version      INTEGER NOT NULL,
+    remaining_after REAL NOT NULL CHECK (remaining_after >= 0),
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY (consumption_no) REFERENCES consumptions(consumption_no),
+    FOREIGN KEY (reservation_no) REFERENCES reservations(reservation_no),
+    FOREIGN KEY (sample_id)      REFERENCES samples(sample_id),
+    UNIQUE (consumption_no, sample_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_citems_consumption ON consumption_items(consumption_no);
+CREATE INDEX IF NOT EXISTS idx_citems_reservation ON consumption_items(reservation_no);
+CREATE INDEX IF NOT EXISTS idx_citems_sample      ON consumption_items(sample_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_consumption_no_update
+BEFORE UPDATE ON consumptions
+BEGIN
+    SELECT RAISE(ABORT, 'consumptions 不可变:禁止更新核销领用单');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_consumption_no_delete
+BEFORE DELETE ON consumptions
+BEGIN
+    SELECT RAISE(ABORT, 'consumptions 不可变:禁止删除核销领用单');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_citem_no_update
+BEFORE UPDATE ON consumption_items
+BEGIN
+    SELECT RAISE(ABORT, 'consumption_items 不可变:禁止更新核销明细');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_citem_no_delete
+BEFORE DELETE ON consumption_items
+BEGIN
+    SELECT RAISE(ABORT, 'consumption_items 不可变:禁止删除核销明细');
+END;
+
 -- 已执行的数据库迁移登记(幂等升级用)
 CREATE TABLE IF NOT EXISTS schema_migrations (
     name       TEXT PRIMARY KEY,

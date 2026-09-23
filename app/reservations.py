@@ -4,7 +4,9 @@
   「当前余量 - 未释放预留」是否足够,全部足够才一次落库,否则整单回滚
 - 幂等:同一预留号 + 同一请求体重放,返回首次结果;同号不同内容 409
 - 释放:整单释放全部明细,释放同样按预留号幂等
-- 查询:返回样品当前余量、已预留量(未释放预留合计)与可用量
+- 查询:返回样品当前余量、已预留量(未释放预留的**未核销**锁定合计)与可用量
+- 核销领用由 consumptions 模块完成;核销后只把预留明细的未核销部分计入锁定量,
+  释放预留时仅解除剩余(未核销)锁定
 - 审计:预留 / 重放 / 释放 / 查询事件均写入 reservation_events 持久化
 """
 from __future__ import annotations
@@ -72,7 +74,11 @@ def _log_event(
 def _availability_map(
     conn: sqlite3.Connection, sample_ids: list[str]
 ) -> dict[str, dict]:
-    """取各样品当前余量与未释放预留合计,计算可用量。"""
+    """取各样品当前余量与未释放预留的**未核销**锁定合计,计算可用量。
+
+    核销领用后只把预留明细的未核销部分继续计入锁定量
+    (item.amount − 该明细已核销合计),已核销部分随样品余量一起出库。
+    """
     out: dict[str, dict] = {}
     if not sample_ids:
         return out
@@ -81,7 +87,11 @@ def _availability_map(
         f"""SELECT s.sample_id AS sample_id, s.unit AS unit,
                    s.remaining AS remaining,
                    COALESCE((
-                       SELECT SUM(ri.amount)
+                       SELECT SUM(ri.amount - COALESCE(
+                           (SELECT SUM(ci.amount)
+                              FROM consumption_items ci
+                             WHERE ci.reservation_no = ri.reservation_no
+                               AND ci.sample_id = ri.sample_id), 0))
                          FROM reservation_items ri
                          JOIN reservations r ON r.reservation_no = ri.reservation_no
                         WHERE ri.sample_id = s.sample_id AND r.status = 'active'
@@ -98,6 +108,20 @@ def _availability_map(
             "reserved": reserved,
             "available": _r(remaining - reserved),
         }
+    return out
+
+
+def _item_consumed_map(
+    conn: sqlite3.Connection, reservation_no: str
+) -> dict[str, float]:
+    """一张预留单内各样品已核销领用合计。"""
+    out: dict[str, float] = {}
+    for row in conn.execute(
+        "SELECT sample_id, SUM(amount) AS consumed FROM consumption_items"
+        " WHERE reservation_no = ? GROUP BY sample_id",
+        (reservation_no,),
+    ).fetchall():
+        out[row["sample_id"]] = _r(row["consumed"])
     return out
 
 
@@ -120,6 +144,7 @@ def _build_result(
     """组装预留单结果:明细附带各样品当前余量/已预留/可用量快照。"""
     rows = _load_items(conn, header["reservation_no"])
     avail = _availability_map(conn, [r["sample_id"] for r in rows])
+    consumed = _item_consumed_map(conn, header["reservation_no"])
     return s.ReservationResult(
         reservation_no=header["reservation_no"],
         status=header["status"],
@@ -135,6 +160,10 @@ def _build_result(
                 remaining=avail[r["sample_id"]]["remaining"],
                 reserved=avail[r["sample_id"]]["reserved"],
                 available=avail[r["sample_id"]]["available"],
+                consumed=consumed.get(r["sample_id"], 0.0),
+                remaining_locked=_r(
+                    _r(r["amount"]) - consumed.get(r["sample_id"], 0.0)
+                ),
             )
             for r in rows
         ],
