@@ -221,6 +221,9 @@ class SampleBalance(BaseModel):
     adjustments: float = Field(
         default=0.0, description="盘点调整流水合计(实盘-系统,可正可负)"
     )
+    writeoffs: float = Field(
+        default=0.0, description="预留核销(领用)出库合计,纳入余量账本重算"
+    )
     available: float
 
 
@@ -258,11 +261,17 @@ class ReservationRequest(BaseModel):
 
 class ReservationItemOut(BaseModel):
     sample_id: str
-    amount: float
+    amount: float = Field(description="预留锁定总量")
     unit: str
     remaining: float = Field(description="样品当前余量(冗余余量)")
-    reserved: float = Field(description="该样品未释放预留的锁定总量(含本单)")
+    reserved: float = Field(description="该样品未释放预留的锁定总量(含本单未核销部分)")
     available: float = Field(description="可用量 = 当前余量 - 未释放预留")
+    written_off: float = Field(
+        default=0.0, description="本预留单该样品累计已核销(领用)量"
+    )
+    outstanding: float = Field(
+        default=0.0, description="本预留单该样品尚未核销(仍锁定)的量 = amount - written_off"
+    )
 
 
 class ReservationResult(BaseModel):
@@ -301,6 +310,73 @@ class SampleAvailability(BaseModel):
 
 class AvailabilityResponse(BaseModel):
     samples: list[SampleAvailability]
+
+
+# ---------------------------------------------------------------- 预留分次核销(领用)
+
+class WriteoffItemIn(BaseModel):
+    """核销明细:对预留单中该样品本次领用 amount(单位沿用样品主数据)。"""
+
+    sample_id: str = Field(min_length=1)
+    amount: Amount
+
+
+class WriteoffRequest(BaseModel):
+    """对已有未释放预留单做一次分次核销(领用)。
+
+    单事务内校验:预留存在且未释放、逐项本次核销量不超过该样品在本预留单内
+    的未核销(仍锁定)量、且不超过样品当前余量;任一失败整单不变。
+    同一核销号 + 同一请求体重放返回首次结果,同号不同内容 409。
+    """
+
+    writeoff_no: str = Field(min_length=1, description="核销号(幂等键),全局唯一")
+    reservation_no: str = Field(min_length=1, description="要核销的预留号,必须未释放")
+    items: list[WriteoffItemIn] = Field(min_length=1)
+    operator: str = Field(min_length=1, description="领用人/操作者(审计必填)")
+    note: Optional[str] = Field(default=None, description="备注,仅用于审计展示")
+
+    @model_validator(mode="after")
+    def _check_items(self) -> "WriteoffRequest":
+        ids = [i.sample_id for i in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("items 中存在重复 sample_id")
+        return self
+
+
+class WriteoffItemOut(BaseModel):
+    sample_id: str
+    amount: float = Field(description="本次核销(领用)量")
+    unit: str
+    remaining: float = Field(description="核销后的样品余量")
+    from_version: int
+    to_version: int
+    item_amount: float = Field(description="该样品在预留单中的预留总量")
+    written_off: float = Field(description="本次后该样品在本预留单的累计核销量")
+    outstanding: float = Field(description="该样品在本预留单仍未核销(仍锁定)的量")
+
+
+class WriteoffResult(BaseModel):
+    writeoff_no: str
+    reservation_no: str
+    operator: str = Field(description="领用人/操作者")
+    note: Optional[str] = None
+    items: list[WriteoffItemOut] = Field(description="逐项核销结果")
+    remaining: dict[str, float] = Field(
+        default_factory=dict, description="核销涉及样品的最新余量"
+    )
+    writeoff_at: str = Field(description="核销时间(首次提交落库时间,UTC)")
+    replayed: bool = Field(
+        default=False, description="True 表示命中核销号幂等,返回首次结果"
+    )
+    created_at: Optional[str] = None
+
+
+class WriteoffListResponse(BaseModel):
+    reservation_no: str
+    status: Literal["active", "released"] = Field(description="预留单当前状态")
+    writeoffs: list[WriteoffResult] = Field(
+        description="该预留单的全部核销记录,按核销时间先后排列"
+    )
 
 
 # ---------------------------------------------------------------- 盘点

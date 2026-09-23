@@ -14,6 +14,7 @@ from . import reservations as rsv
 from . import service
 from . import stocktakes as st
 from . import transfers as tr
+from . import writeoffs as wo
 from .config import BALANCE_TOLERANCE, DB_PATH
 from .db import connect, get_conn, init_db
 
@@ -43,6 +44,9 @@ app = FastAPI(
         "- 预留模块:一个预留号为多个样品分别锁定数量,\n"
         "  单事务校验各样品可用量(余量-未释放预留),全部足够才创建,\n"
         "  支持按预留号幂等重放与整单释放\n"
+        "- 预留分次核销(领用):对未释放预留单提交核销号与逐项领用量,\n"
+        "  单事务校验预留未释放、逐项未核销量与样品余量,任一失败整单不变,\n"
+        "  成功扣减余量、递增版本并写不可变核销明细;已核销部分不再计入锁定量\n"
         "- 盘点模块:按样品编号集合建批保存余量/版本快照,\n"
         "  提交实盘时乐观锁校验余量未被改变并计算差异,\n"
         "  确认时单事务二次校验版本、写盘点调整流水并更新余量\n"
@@ -106,6 +110,28 @@ async def transfer_error_handler(
         status_code=409,
         content={
             "error": "conflict",
+            "conflicts": [c.model_dump() for c in exc.conflicts],
+        },
+    )
+
+
+@app.exception_handler(wo.WriteoffError)
+async def writeoff_error_handler(
+    _request, exc: wo.WriteoffError
+) -> JSONResponse:
+    code = exc.conflicts[0].code if exc.conflicts else "writeoff_error"
+    status_code = (
+        404 if code in ("reservation_not_found", "writeoff_not_found") else 409
+    )
+    error_name = (
+        "not_found"
+        if code in ("reservation_not_found", "writeoff_not_found")
+        else "conflict"
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": error_name,
             "conflicts": [c.model_dump() for c in exc.conflicts],
         },
     )
@@ -437,6 +463,61 @@ def query_availability(
     conn: sqlite3.Connection = Depends(get_conn),
 ) -> s.AvailabilityResponse:
     return rsv.get_availability(conn, sample_id)
+
+
+# ---------------------------------------------------------------- 预留分次核销(领用)
+
+@app.post(
+    "/api/v1/reservations/{reservation_no}/writeoffs",
+    response_model=s.WriteoffResult,
+    tags=["预留"],
+    summary="分次核销(领用):单事务校验预留未释放、逐项未核销量与样品余量,"
+            "任一失败整单不变;成功扣减余量、递增版本并写不可变核销明细",
+)
+def create_writeoff(
+    reservation_no: str,
+    body: s.WriteoffRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.WriteoffResult:
+    # 路径与请求体的预留号必须一致,避免歧义
+    if body.reservation_no != reservation_no:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "validation_error",
+                "message": (
+                    f"路径预留号 {reservation_no} 与请求体预留号"
+                    f" {body.reservation_no} 不一致"
+                ),
+            },
+        )
+    return wo.create_writeoff(conn, body)
+
+
+@app.get(
+    "/api/v1/reservations/{reservation_no}/writeoffs",
+    response_model=s.WriteoffListResponse,
+    tags=["预留"],
+    summary="按预留号查询全部核销(领用)记录,按核销时间先后排列",
+)
+def list_writeoffs(
+    reservation_no: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.WriteoffListResponse:
+    return wo.list_writeoffs(conn, reservation_no)
+
+
+@app.get(
+    "/api/v1/writeoffs/{writeoff_no}",
+    response_model=s.WriteoffResult,
+    tags=["预留"],
+    summary="按核销号查询首次核销结果(幂等回放内容)",
+)
+def get_writeoff(
+    writeoff_no: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.WriteoffResult:
+    return wo.get_writeoff(conn, writeoff_no)
 
 
 # ---------------------------------------------------------------- 盘点

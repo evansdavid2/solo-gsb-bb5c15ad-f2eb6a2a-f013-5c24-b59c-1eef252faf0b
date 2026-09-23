@@ -81,9 +81,15 @@ def _availability_map(
         f"""SELECT s.sample_id AS sample_id, s.unit AS unit,
                    s.remaining AS remaining,
                    COALESCE((
-                       SELECT SUM(ri.amount)
+                       SELECT SUM(ri.amount - COALESCE(wo.spent, 0))
                          FROM reservation_items ri
                          JOIN reservations r ON r.reservation_no = ri.reservation_no
+                         LEFT JOIN (
+                             SELECT reservation_no, sample_id, SUM(amount) AS spent
+                               FROM writeoff_items
+                              GROUP BY reservation_no, sample_id
+                         ) wo ON wo.reservation_no = ri.reservation_no
+                              AND wo.sample_id = ri.sample_id
                         WHERE ri.sample_id = s.sample_id AND r.status = 'active'
                    ), 0) AS reserved
               FROM samples s
@@ -111,6 +117,18 @@ def _load_items(
     ).fetchall()
 
 
+def _written_off_map(
+    conn: sqlite3.Connection, reservation_no: str
+) -> dict[str, float]:
+    """某预留单内各样品累计已核销(领用)量。"""
+    rows = conn.execute(
+        "SELECT sample_id, COALESCE(SUM(amount), 0) AS spent"
+        " FROM writeoff_items WHERE reservation_no = ? GROUP BY sample_id",
+        (reservation_no,),
+    ).fetchall()
+    return {r["sample_id"]: _r(r["spent"]) for r in rows}
+
+
 def _build_result(
     conn: sqlite3.Connection,
     header: sqlite3.Row,
@@ -120,6 +138,7 @@ def _build_result(
     """组装预留单结果:明细附带各样品当前余量/已预留/可用量快照。"""
     rows = _load_items(conn, header["reservation_no"])
     avail = _availability_map(conn, [r["sample_id"] for r in rows])
+    spent = _written_off_map(conn, header["reservation_no"])
     return s.ReservationResult(
         reservation_no=header["reservation_no"],
         status=header["status"],
@@ -135,6 +154,8 @@ def _build_result(
                 remaining=avail[r["sample_id"]]["remaining"],
                 reserved=avail[r["sample_id"]]["reserved"],
                 available=avail[r["sample_id"]]["available"],
+                written_off=spent.get(r["sample_id"], 0.0),
+                outstanding=_r(r["amount"] - spent.get(r["sample_id"], 0.0)),
             )
             for r in rows
         ],

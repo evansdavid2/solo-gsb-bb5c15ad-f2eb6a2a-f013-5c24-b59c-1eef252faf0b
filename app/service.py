@@ -374,15 +374,25 @@ def _shortest_path(
 def _reserved_map(
     conn: sqlite3.Connection, sample_ids: list[str]
 ) -> dict[str, float]:
-    """各样品未释放预留的锁定总量(与预留模块同口径)。"""
+    """各样品未释放预留的锁定总量(与预留模块同口径)。
+
+    已核销(领用)部分不再锁定,故逐项为「预留量 − 该单累计核销量」。
+    """
     out: dict[str, float] = {sid: 0.0 for sid in sample_ids}
     if not sample_ids:
         return out
     qmarks = ",".join("?" * len(sample_ids))
     rows = conn.execute(
-        f"""SELECT ri.sample_id AS sample_id, SUM(ri.amount) AS reserved
+        f"""SELECT ri.sample_id AS sample_id,
+                   SUM(ri.amount - COALESCE(wo.spent, 0)) AS reserved
               FROM reservation_items ri
               JOIN reservations r ON r.reservation_no = ri.reservation_no
+              LEFT JOIN (
+                  SELECT reservation_no, sample_id, SUM(amount) AS spent
+                    FROM writeoff_items
+                   GROUP BY reservation_no, sample_id
+              ) wo ON wo.reservation_no = ri.reservation_no
+                   AND wo.sample_id = ri.sample_id
              WHERE r.status = 'active'
                AND ri.sample_id IN ({qmarks})
              GROUP BY ri.sample_id""",
@@ -826,7 +836,7 @@ def trace_sample(
 
 # ---------------------------------------------------------------- 余量校验
 
-def _ledger_remaining(conn: sqlite3.Connection, sample_id: str) -> tuple[float, float, float]:
+def _ledger_remaining(conn: sqlite3.Connection, sample_id: str) -> tuple[float, float, float, float]:
     """账本重算余量。
 
     - 非根样品:Σin − Σout(全部来自谱系转移)
@@ -834,6 +844,8 @@ def _ledger_remaining(conn: sqlite3.Connection, sample_id: str) -> tuple[float, 
       重算时排除,避免双算;之后仍可能被其他样品并入(Σin)。
     - 销毁(dispose_id 非空的 out 流水,无谱系边)与盘点调整
       (stocktake_adjustments.delta,可正可负)作为非谱系流水一并计入。
+    - 预留分次核销(writeoff_items.amount)是另一条非谱系出账(领用出库),
+      同样计入重算。
     """
     smp = conn.execute(
         "SELECT initial_amount, is_root FROM samples WHERE sample_id = ?",
@@ -854,10 +866,16 @@ def _ledger_remaining(conn: sqlite3.Connection, sample_id: str) -> tuple[float, 
         " WHERE sample_id = ?",
         (sample_id,),
     ).fetchone()
+    woff = conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) AS w FROM writeoff_items"
+        " WHERE sample_id = ?",
+        (sample_id,),
+    ).fetchone()
     source = smp["initial_amount"] if is_root else 0.0
     tin, tout = _r(row["tin"]), _r(row["tout"])
     adjustments = _r(adj["d"])
-    return tin, tout, _r(source + tin - tout + adjustments)
+    writeoffs = _r(woff["w"])
+    return tin, tout, _r(source + tin - tout + adjustments - writeoffs), writeoffs
 
 
 def get_balance(
@@ -869,7 +887,7 @@ def get_balance(
             _conflict("sample_not_found", f"样品 {sample_id} 不存在",
                       sample_id=sample_id)
         ])
-    tin, tout, ledger_rem = _ledger_remaining(conn, sample_id)
+    tin, tout, ledger_rem, writeoffs = _ledger_remaining(conn, sample_id)
     stored = _r(smp["remaining"])
     adj_row = conn.execute(
         "SELECT COALESCE(SUM(delta), 0) AS d FROM stocktake_adjustments"
@@ -885,6 +903,7 @@ def get_balance(
         total_in=tin,
         total_out=tout,
         adjustments=_r(adj_row["d"]),
+        writeoffs=writeoffs,
         available=stored,
     )
 

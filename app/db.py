@@ -112,6 +112,72 @@ CREATE TABLE IF NOT EXISTS reservation_events (
 
 CREATE INDEX IF NOT EXISTS idx_revents_reservation ON reservation_events(reservation_no);
 
+-- 预留分次核销(领用)单:一个核销号 writeoff_no 针对一个未释放预留号
+-- reservation_no,一次领用若干样品;同号同内容幂等重放,同号不同内容冲突。
+-- 核销成功即扣减样品余量、递增样品版本并写不可变核销明细;
+-- 被核销部分不再计入该预留的锁定量(锁定量 = 预留量 - 已核销合计)。
+CREATE TABLE IF NOT EXISTS writeoffs (
+    writeoff_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    writeoff_no    TEXT NOT NULL UNIQUE,
+    reservation_no TEXT NOT NULL,
+    operator       TEXT,
+    payload        TEXT NOT NULL,
+    result         TEXT NOT NULL,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY (reservation_no) REFERENCES reservations(reservation_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_writeoffs_reservation ON writeoffs(reservation_no);
+
+-- 预留核销逐项明细:每条对应该核销单中一个样品的实际领用量;
+-- 累计核销不得超过预留明细的预留量;触发器禁止 UPDATE/DELETE(不可变)。
+-- 核销量同时是余量账本的非谱系出账(账本重算时与盘点调整一并计入)。
+CREATE TABLE IF NOT EXISTS writeoff_items (
+    item_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    writeoff_id    INTEGER NOT NULL,
+    writeoff_no    TEXT NOT NULL,
+    reservation_no TEXT NOT NULL,
+    sample_id      TEXT NOT NULL,
+    seq_index      INTEGER NOT NULL,
+    amount         REAL NOT NULL CHECK (amount > 0),
+    unit           TEXT NOT NULL,
+    from_version   INTEGER NOT NULL,
+    to_version     INTEGER NOT NULL,
+    remaining_after REAL NOT NULL CHECK (remaining_after >= 0),
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY (writeoff_id)    REFERENCES writeoffs(writeoff_id),
+    FOREIGN KEY (reservation_no) REFERENCES reservations(reservation_no),
+    FOREIGN KEY (sample_id)      REFERENCES samples(sample_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_witems_writeoff    ON writeoff_items(writeoff_no);
+CREATE INDEX IF NOT EXISTS idx_witems_reservation ON writeoff_items(reservation_no);
+CREATE INDEX IF NOT EXISTS idx_witems_sample      ON writeoff_items(sample_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_writeoff_hdr_no_update
+BEFORE UPDATE ON writeoffs
+BEGIN
+    SELECT RAISE(ABORT, 'writeoffs 不可变:禁止更新核销单');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_writeoff_hdr_no_delete
+BEFORE DELETE ON writeoffs
+BEGIN
+    SELECT RAISE(ABORT, 'writeoffs 不可变:禁止删除核销单');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_writeoff_no_update
+BEFORE UPDATE ON writeoff_items
+BEGIN
+    SELECT RAISE(ABORT, 'writeoff_items 不可变:禁止更新核销明细');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_writeoff_no_delete
+BEFORE DELETE ON writeoff_items
+BEGIN
+    SELECT RAISE(ABORT, 'writeoff_items 不可变:禁止删除核销明细');
+END;
+
 -- 已执行的数据库迁移登记(幂等升级用)
 CREATE TABLE IF NOT EXISTS schema_migrations (
     name       TEXT PRIMARY KEY,
